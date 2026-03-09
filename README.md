@@ -1,16 +1,130 @@
-# React + Vite
+# 🎻 Violin Session
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Real-time collaborative violin practice app. Two musicians connect and see each other's pitch and spectral analysis with minimal latency.
 
-Currently, two official plugins are available:
+## Architecture
+```
+Mac (lightweight client)
+├── audio_client.py     ← pyaudio + aubio (pitch detection)
+│   ├── pitch local  → ws://localhost:8001 → React "VOS" (instant)
+│   └── audio chunks → ws://SERVER/audio  → pipeline server
+│
+Server (Docker / Kubernetes)
+├── pipeline_server.py  ← FastAPI + scipy (mel spectrogram)
+└── nginx               ← serves React frontend + proxies WebSockets
+```
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## Stack
 
-## React Compiler
+| Layer | Technology |
+|---|---|
+| Audio capture | pyaudio + aubio (YIN pitch detection) |
+| Backend | FastAPI + uvicorn |
+| Mel processing | scipy (no librosa/numba) |
+| Frontend | React + Vite |
+| Container | Docker + nginx |
+| Orchestration | Kubernetes (Minikube for local dev) |
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Requirements
 
-## Expanding the ESLint configuration
+**Server**
+- Docker
+- kubect)**
+- Python 3.12
+- `brew install portaudio aubio` (macOS)
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Setup
+
+### 1. Install client dependencies
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-client.txt
+```
+
+### 2. Run locally (without Kubernetes)
+```bash
+# Terminal 1 — server
+docker-compose up
+
+# Terminal 2 — audio nt
+python violin_backend/audio_client.py <session-id> --server ws://localhost:8000/audio
+
+# Terminal 3 — frontend (dev mode)
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`
+
+### 3. Run on Kubernetes (Minikube)
+```bash
+# Start Minikube and build image
+minikube start
+eval $(minikube docker-env)
+docker build -t violin-server:latest .
+
+# Enable ingress and deploy
+minikube addons enable ingre
+kubectl apply -f k8s/
+
+# Get service URLs
+minikube service violin-server --url
+# First URL = nginx (port 80) → open in browser
+# Second URL = API (port 8000) → use for audio client
+
+# Connect audio client
+python violin_backend/audio_client.py <session-id> --server ws://<SECOND_URL>/audio
+```
+
+### 4. Build frontend for production
+```bash
+npm run build
+```
+
+The Dockerfile includes a multi-stage build — React is compiled and served by nginx inside the container.
+
+## Usage
+
+Two musicians join the same session:
+```bash
+# Musician A
+python violin_backend/audio_client.py jam-session-1 --server ws://rver.com/audio
+
+# Musician B (different machine)
+python violin_backend/audio_client.py jam-session-1 --server ws://yourserver.com/audio
+```
+
+Both open `http://yourserver.com` in the browser. Each sees the other's pitch and mel spectrogram in real time.
+
+## Latency
+
+| Path | Latency |
+|---|---|
+| Local pitch (tuner "Vos") | ~0ms |
+| Mel own signal | ~60-80ms |
+| Other musician's signal | ~60-80ms |
+
+## Project Structure
+```
+violin-sim/
+├── violin_backend├── audio_client.py       # Lightweight client (pyaudio + aubio)
+│   └── pipeline_server.py    # FastAPI WebSocket server
+├── src/
+│   └── ViolinSession.jsx     # React UI (tuner + waterfall + energy bars)
+├── k8s/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── ingress.yaml
+├── Dockerfile                # Multi-stage: React build + Python server + nginx
+├── docker-compose.yml
+├── nginx.conf
+└── docker-entrypoint.sh
+```
+
+## Roadmap
+
+- [ ] SpacetimeDB for real multiplayer (replace WebSocket relay)
+- [ ] Own spectrogram (send mel
+- [ ] Vibrato analysis
+- [ ] Deploy to cloud (EKS / GKE / DigitalOcean)
