@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+websockets
+numpy
+scipy
+soundfile
+typing_extensions
+joblib
+lazy_loader
