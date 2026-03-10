@@ -1,8 +1,24 @@
 services:
+  spacetimedb:
+    build:
+      context: .
+      dockerfile: spacetimedb.Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - spacetime-data:/home/spacetime/.local/share/spacetime
+    restart: unless-stopped
+
   pipeline:
     build: .
     ports:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
+      - SPACETIMEDB_URL=http://spacetimedb:3000
+    depends_on:
+      - spacetimedb
     restart: unless-stopped
+
+volumes:
+  spacetime-data:

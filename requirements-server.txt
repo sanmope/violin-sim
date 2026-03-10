@@ -7,3 +7,4 @@ soundfile
 typing_extensions
 joblib
 lazy_loader
+httpx

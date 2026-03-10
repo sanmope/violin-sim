@@ -9,12 +9,18 @@ __pycache__/
 node_modules/
 dist/
 
+#Rust
+server-module/
+
 # Env
 .env.local
 .env.*.local
+CLAUDE.md
+
 
 # OS
 .DS_Store
 
 # Minikube / Docker
 *.log
+

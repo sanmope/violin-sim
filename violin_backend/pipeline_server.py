@@ -1,23 +1,25 @@
 # pipeline_server.py
 import asyncio
 import json
+import os
 import numpy as np
-import json
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from dataclasses import dataclass, field
-from typing import Callable, Awaitable
+import httpx
 
 SAMPLE_RATE = 44100
-FMIN        = 196.0
-FMAX        = 3520.0
+FMIN        = 49.0
+FMAX        = 2637.0
 N_MELS      = 64
 BUFFER_CONFIGS = [
     {"name": "fast",   "window": SAMPLE_RATE // 20, "n_mels": 32},   # 50ms
     {"name": "mid",    "window": SAMPLE_RATE // 10, "n_mels": 64},   # 100ms
     {"name": "smooth", "window": SAMPLE_RATE // 4,  "n_mels": 128},  # 250ms
 ]
+
+SPACETIMEDB_URL = os.environ.get("SPACETIMEDB_URL", "http://localhost:3000")
+STDB_DB_NAME    = os.environ.get("STDB_DB_NAME", "violin-session")
 
 app = FastAPI()
 app.add_middleware(
@@ -26,6 +28,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+http_client: httpx.AsyncClient | None = None
+
+
+@app.on_event("startup")
+async def startup():
+    global http_client
+    http_client = httpx.AsyncClient(timeout=5.0)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if http_client:
+        await http_client.aclose()
+
+
+# --- SpacetimeDB HTTP helpers ---
+
+async def stdb_call(reducer: str, args: list):
+    """Call a SpacetimeDB reducer via HTTP API."""
+    url = f"{SPACETIMEDB_URL}/v1/database/{STDB_DB_NAME}/call/{reducer}"
+    try:
+        resp = await http_client.post(url, json=args)
+        if resp.status_code not in (200, 204):
+            print(f"[stdb] {reducer} failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"[stdb] {reducer} error: {e}")
 
 
 # --- Ring buffer ---
@@ -43,13 +72,11 @@ class RingBuffer:
         return self._buf.copy()
 
 
-# --- Session: agrupa los clientes conectados ---
+# --- Session: agrupa los audio clients conectados ---
 
 class Session:
     def __init__(self, session_id: str):
         self.session_id = session_id
-        # cliente_id → websocket de React (para recibir frames del otro músico)
-        self.react_clients: dict[str, WebSocket] = {}
         # cliente_id → ring buffers propios
         self.ring_buffers: dict[str, dict[str, RingBuffer]] = {}
 
@@ -62,27 +89,6 @@ class Session:
     def remove_audio_client(self, client_id: str):
         self.ring_buffers.pop(client_id, None)
         print(f"[session:{self.session_id}] audio client desconectado: {client_id}")
-
-    def add_react_client(self, client_id: str, ws: WebSocket):
-        self.react_clients[client_id] = ws
-        print(f"[session:{self.session_id}] react client conectado: {client_id}")
-
-    def remove_react_client(self, client_id: str):
-        self.react_clients.pop(client_id, None)
-        print(f"[session:{self.session_id}] react client desconectado: {client_id}")
-
-    async def broadcast_to_react(self, sender_id: str, payload: bytes):
-        """Enviar frame a todos los React clients EXCEPTO al propio sender."""
-        dead = []
-        for client_id, ws in self.react_clients.items():
-            if client_id == sender_id:
-                continue
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                dead.append(client_id)
-        for d in dead:
-            self.react_clients.pop(d, None)
 
 
 # --- Store de sesiones ---
@@ -124,20 +130,20 @@ def compute_mel(window: np.ndarray, n_mels: int) -> np.ndarray:
     return mel_norm.mean(axis=1).astype(np.float32)
 
 
-async def process_chunk(session: Session, client_id: str, payload: dict) -> list[bytes]:
+async def process_and_publish(session: Session, client_id: str, payload: dict):
     """
-    Recibe un chunk de audio, actualiza los ring buffers y
-    devuelve una lista de frames serializados (uno por buffer config).
+    Recibe un chunk de audio, actualiza los ring buffers,
+    calcula mel y publica cada frame a SpacetimeDB.
     """
     chunk = np.array(payload["chunk"], dtype=np.float32)
     pitch = payload["pitch"]
     ts    = payload["ts"]
 
-    frames = []
-    loop   = asyncio.get_event_loop()
+    loop = asyncio.get_event_loop()
 
     for cfg in BUFFER_CONFIGS:
-        if client_id not in session.ring_buffers: return []
+        if client_id not in session.ring_buffers:
+            return
         ring = session.ring_buffers[client_id][cfg["name"]]
         ring.push(chunk)
 
@@ -146,17 +152,15 @@ async def process_chunk(session: Session, client_id: str, payload: dict) -> list
             None, compute_mel, ring.data, cfg["n_mels"]
         )
 
-        frame = json.dumps({
-            "ts":        ts,
-            "buf":       cfg["name"],
-            "client_id": client_id,
-            "pitch":     round(float(pitch), 2),
-            "mel":       mel.tolist(),
-        })
-
-        frames.append(frame)
-
-    return frames
+        # Publicar a SpacetimeDB (fire-and-forget style)
+        asyncio.create_task(stdb_call("publish_frame", [
+            session.session_id,
+            client_id,
+            cfg["name"],
+            ts,
+            round(float(pitch), 2),
+            mel.tolist(),
+        ]))
 
 
 # --- WebSocket: audio client (Python, en el host del músico) ---
@@ -170,41 +174,18 @@ async def audio_endpoint(ws: WebSocket):
     session = get_or_create_session(session_id)
     session.add_audio_client(client_id)
 
+    # Register in SpacetimeDB
+    await stdb_call("join_session", [session_id, client_id])
+
     try:
         while True:
             data    = await ws.receive_text()
             payload = json.loads(data)
-
-            frames = await process_chunk(session, client_id, payload)
-
-            # Fan-out a los React clients de la sesión
-            for frame_bytes in frames:
-                await session.broadcast_to_react(client_id, frame_bytes)
+            await process_and_publish(session, client_id, payload)
 
     except WebSocketDisconnect:
         session.remove_audio_client(client_id)
-
-
-# --- WebSocket: React client (browser) ---
-
-@app.websocket("/react")
-async def react_endpoint(ws: WebSocket):
-    await ws.accept()
-    session_id = ws.query_params.get("session_id", "default")
-    client_id  = ws.query_params.get("client_id",  "unknown")
-
-    session = get_or_create_session(session_id)
-    session.add_react_client(client_id, ws)
-
-    try:
-        # Mantener la conexion viva con pings periodicos
-        while True:
-            try:
-                await asyncio.wait_for(ws.receive_text(), timeout=10.0)
-            except asyncio.TimeoutError:
-                await ws.send_text("ping")
-    except WebSocketDisconnect:
-        session.remove_react_client(client_id)
+        await stdb_call("leave_session", [session_id, client_id])
 
 
 # --- Health check ---
@@ -213,10 +194,10 @@ async def react_endpoint(ws: WebSocket):
 def health():
     return {
         "status": "ok",
+        "spacetimedb": SPACETIMEDB_URL,
         "sessions": {
             sid: {
                 "audio_clients": list(s.ring_buffers.keys()),
-                "react_clients": list(s.react_clients.keys()),
             }
             for sid, s in sessions.items()
         }
