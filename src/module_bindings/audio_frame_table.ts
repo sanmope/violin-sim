@@ -18,4 +18,5 @@ export default __t.row({
   ts: __t.f64(),
   pitch: __t.f64(),
   mel: __t.array(__t.f32()),
+  fft: __t.array(__t.f32()),
 });

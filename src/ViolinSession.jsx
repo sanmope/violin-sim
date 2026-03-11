@@ -1,13 +1,16 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { DbConnection } from "./module_bindings";
+import { startBrowserAudio } from "./browserAudio";
 
 const N_MELS = 64;
 const WATERFALL_ROWS = 80;
 const NOTE_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 const NOTE_LATIN = ["Do","Do#","Re","Re#","Mi","Fa","Fa#","Sol","Sol#","La","La#","Si"];
 const SESSION_ID = import.meta.env.VITE_SESSION_ID || "mi-sesion-123";
-const CLIENT_ID  = "react-client-1";
-const STDB_HOST  = import.meta.env.VITE_STDB_HOST || window.location.hostname;
+// CLIENT_ID must match the audio source's client_id so we filter out our own frames
+// audio_client.py uses: `${SESSION_ID}-audio`
+// browserAudio.js uses: `${SESSION_ID}-browser`
+const STDB_HOST  = import.meta.env.VITE_STDB_HOST || window.__VIOLIN_SERVER_IP || window.location.hostname;
 const STDB_URL   = `ws://${STDB_HOST}:3000`;
 
 // 2 octaves below G3 to 2 octaves above E5
@@ -261,11 +264,12 @@ function EnergyBars({ mel, color }) {
 
 export default function ViolinSession() {
   const [local, setLocal] = useState({ pitch: 0, mel: [], fft: [], history: [] });
-  const [remote, setRemote] = useState({ pitch: 0, mel: [], history: [] });
+  const [remote, setRemote] = useState({ pitch: 0, mel: [], fft: [], history: [] });
   const [connected, setConnected] = useState({ server: false, local: false });
   const [scaleIdx, setScaleIdx] = useState(1);
   const connRef = useRef(null);
   const localWsRef = useRef(null);
+  const localClientId = useRef(`${SESSION_ID}-audio`);  // updated when browser mode activates
 
   const scaleDef = SCALE_DEFS[scaleIdx];
   const scaleNotes = scaleDef.get ? scaleDef.get() : (scaleDef.notes || []);
@@ -282,11 +286,13 @@ export default function ViolinSession() {
 
           const handleFrame = (row) => {
             if (row.bufName !== "mid") return;
-            if (row.clientId === CLIENT_ID) return;
+            if (row.clientId === localClientId.current) return;
             const mel = Array.from(row.mel);
+            const fft = row.fft ? Array.from(row.fft) : [];
             setRemote(prev => ({
               pitch:   row.pitch,
               mel:     mel,
+              fft:     fft,
               history: [...prev.history.slice(-(WATERFALL_ROWS - 1)), mel],
             }));
           };
@@ -295,6 +301,8 @@ export default function ViolinSession() {
           connection.db.audio_frame.onUpdate((_ctx, _old, row) => handleFrame(row));
 
           connection.subscriptionBuilder()
+            .onApplied(() => console.log("[stdb] subscription applied"))
+            .onError((_ctx, err) => console.error("[stdb] subscription error:", err))
             .subscribe(`SELECT * FROM audio_frame WHERE session_id = '${SESSION_ID}'`);
         })
         .onConnectError((_ctx, error) => {
@@ -302,6 +310,7 @@ export default function ViolinSession() {
           setConnected(c => ({ ...c, server: false }));
         })
         .onDisconnect(() => {
+          console.warn("[stdb] Disconnected");
           setConnected(c => ({ ...c, server: false }));
         })
         .build();
@@ -314,33 +323,78 @@ export default function ViolinSession() {
     return () => { try { conn?.disconnect(); } catch(e) {} };
   }, []);
 
-  // --- Local WebSocket (audio_client.py :8001) ---
+  // --- Local audio: try WebSocket first, fallback to browser mic ---
+  const handleAudioFrame = useCallback((msg) => {
+    if (msg.type === "pitch") {
+      setLocal(prev => {
+        const mel = msg.mel || prev.mel;
+        const fft = msg.fft || prev.fft;
+        return {
+          pitch: msg.pitch, mel, fft,
+          history: msg.mel ? [...prev.history.slice(-(WATERFALL_ROWS - 1)), mel] : prev.history,
+        };
+      });
+    }
+  }, []);
+
   useEffect(() => {
     const url = `${import.meta.env.VITE_LOCAL_WS || "ws://localhost:8001"}`;
-    function connect() {
-      const ws = new WebSocket(url);
-      localWsRef.current = ws;
-      ws.onopen  = () => setConnected(c => ({ ...c, local: true }));
-      ws.onclose = () => { setConnected(c => ({ ...c, local: false })); setTimeout(connect, 2000); };
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "pitch") {
-            setLocal(prev => {
-              const mel = msg.mel || prev.mel;
-              const fft = msg.fft || prev.fft;
-              return {
-                pitch: msg.pitch, mel, fft,
-                history: msg.mel ? [...prev.history.slice(-(WATERFALL_ROWS - 1)), mel] : prev.history,
-              };
-            });
-          }
-        } catch(e) {}
-      };
+    let stopBrowser = null;
+    let wsTimeout = null;
+    let wsConnected = false;
+    let cancelled = false;
+
+    function startBrowserFallback() {
+      if (cancelled || wsConnected) return;
+      // Unique ID per device so two browsers don't filter each other out
+      const browserId = `${SESSION_ID}-browser-${Math.random().toString(36).slice(2, 8)}`;
+      console.log("[audio] No local WS — using browser mic, id:", browserId);
+      localClientId.current = browserId;
+      setConnected(c => ({ ...c, local: true, mode: "browser" }));
+      const serverUrl = `ws://${STDB_HOST}:8000/audio`;
+      stopBrowser = startBrowserAudio(handleAudioFrame, serverUrl, SESSION_ID, browserId);
     }
+
+    function connect() {
+      if (cancelled) return;
+      try {
+        const ws = new WebSocket(url);
+        localWsRef.current = ws;
+        ws.onopen = () => {
+          wsConnected = true;
+          if (wsTimeout) clearTimeout(wsTimeout);
+          setConnected(c => ({ ...c, local: true, mode: "ws" }));
+        };
+        ws.onclose = () => {
+          if (cancelled) return;
+          setConnected(c => ({ ...c, local: false }));
+          if (wsConnected) {
+            wsConnected = false;
+            setTimeout(connect, 2000);
+          }
+        };
+        ws.onerror = () => {};
+        ws.onmessage = (event) => {
+          try { handleAudioFrame(JSON.parse(event.data)); } catch(e) {}
+        };
+      } catch(e) {
+        startBrowserFallback();
+      }
+    }
+
+    // Try WS first, fallback to browser mic after 3s
     connect();
-    return () => localWsRef.current?.close();
-  }, []);
+    wsTimeout = setTimeout(() => {
+      if (!wsConnected && !cancelled) startBrowserFallback();
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      if (wsTimeout) clearTimeout(wsTimeout);
+      localWsRef.current?.close();
+      if (stopBrowser) stopBrowser();
+    };
+  }, [handleAudioFrame]);
 
   const LOC = "#7c6fff";
   const REM = "#ff6b6b";
@@ -365,7 +419,7 @@ export default function ViolinSession() {
             {connected.server ? "stdb" : "stdb off"}
           </span>
           <span style={{ color: connected.local ? "#00aaff" : "#ff4444" }}>
-            {connected.local ? "local" : "local off"}
+            {connected.local ? (connected.mode === "browser" ? "mic" : "local") : "local off"}
           </span>
         </div>
       </div>
@@ -380,7 +434,7 @@ export default function ViolinSession() {
       {/* FFT — takes remaining space */}
       <div style={{ display: "flex", gap: 8, flex: 1, minHeight: 0, marginBottom: 8 }}>
         <Spectrum data={local.fft} color={LOC} label="Vos" scaleNotes={scaleNotes} />
-        <Spectrum data={remote.mel} color={REM} label="Otro musico" scaleNotes={scaleNotes} />
+        <Spectrum data={remote.fft} color={REM} label="Otro musico" scaleNotes={scaleNotes} />
       </div>
 
       {/* Energy bars — compact row */}

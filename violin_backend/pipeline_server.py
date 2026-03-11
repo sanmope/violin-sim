@@ -130,14 +130,33 @@ def compute_mel(window: np.ndarray, n_mels: int) -> np.ndarray:
     return mel_norm.mean(axis=1).astype(np.float32)
 
 
+N_FFT_BINS = 256
+_LOG_EDGES = np.logspace(np.log10(FMIN), np.log10(FMAX), N_FFT_BINS + 1)
+
+def compute_fft(window: np.ndarray) -> np.ndarray:
+    """Log-frequency magnitude spectrum from FMIN to FMAX."""
+    spectrum = np.abs(np.fft.rfft(window))
+    freqs    = np.fft.rfftfreq(len(window), 1.0 / SAMPLE_RATE)
+    binned   = np.zeros(N_FFT_BINS, dtype=np.float64)
+    for i in range(N_FFT_BINS):
+        mask = (freqs >= _LOG_EDGES[i]) & (freqs < _LOG_EDGES[i + 1])
+        if mask.any():
+            binned[i] = spectrum[mask].mean()
+    mx = binned.max()
+    if mx > 1e-9:
+        binned /= mx
+    return binned.astype(np.float32)
+
+
 async def process_and_publish(session: Session, client_id: str, payload: dict):
     """
     Recibe un chunk de audio, actualiza los ring buffers,
-    calcula mel y publica cada frame a SpacetimeDB.
+    calcula mel + fft y publica cada frame a SpacetimeDB.
     """
     chunk = np.array(payload["chunk"], dtype=np.float32)
     pitch = payload["pitch"]
     ts    = payload["ts"]
+    print(f"[pipeline] chunk from {client_id}: len={len(chunk)} pitch={pitch}")
 
     loop = asyncio.get_event_loop()
 
@@ -147,12 +166,14 @@ async def process_and_publish(session: Session, client_id: str, payload: dict):
         ring = session.ring_buffers[client_id][cfg["name"]]
         ring.push(chunk)
 
-        # Mel en executor para no bloquear el event loop
-        mel = await loop.run_in_executor(
-            None, compute_mel, ring.data, cfg["n_mels"]
-        )
+        # Only publish "mid" buffer — React ignores the rest
+        if cfg["name"] != "mid":
+            continue
 
-        # Publicar a SpacetimeDB (fire-and-forget style)
+        data = ring.data
+        mel = await loop.run_in_executor(None, compute_mel, data, cfg["n_mels"])
+        fft = await loop.run_in_executor(None, compute_fft, data)
+
         asyncio.create_task(stdb_call("publish_frame", [
             session.session_id,
             client_id,
@@ -160,6 +181,7 @@ async def process_and_publish(session: Session, client_id: str, payload: dict):
             ts,
             round(float(pitch), 2),
             mel.tolist(),
+            fft.tolist(),
         ]))
 
 

@@ -13,7 +13,7 @@ BUFFER_SIZE = SAMPLE_RATE // 20
 SERVER_WS   = "ws://localhost:8000/audio"
 
 # Noise gate: ignore chunks below this RMS level (filters fans, AC, etc.)
-RMS_THRESHOLD = 0.015
+RMS_THRESHOLD = 0.03
 # Pitch confidence: aubio returns 0.0-1.0, reject below this
 CONFIDENCE_THRESHOLD = 0.7
 
@@ -104,14 +104,15 @@ class AudioClient:
                 raw   = stream.read(BUFFER_SIZE, exception_on_overflow=False)
                 chunk = np.frombuffer(raw, dtype=np.float32).copy()
 
-                # Noise gate: skip if audio level is too low
+                # Noise gate
                 rms = float(np.sqrt(np.mean(chunk ** 2)))
+                ts  = int(time.time() * 1000)
+
                 if rms < RMS_THRESHOLD:
                     continue
 
                 pitch = float(self.pitch_detector(chunk)[0])
                 confidence = float(self.pitch_detector.get_confidence())
-                ts    = int(time.time() * 1000)
 
                 # Skip if pitch detection is not confident enough
                 if confidence < CONFIDENCE_THRESHOLD:
